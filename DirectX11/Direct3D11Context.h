@@ -318,6 +318,82 @@ static void RecordShaderResourceUsage(D3D11Wrapper::ID3D11DeviceContext *context
 	}
 }
 
+static D3D11Base::ID3D11DepthStencilView *SavedDepthTarget;
+
+static void TransferDepthTargetToShaderInput(D3D11Wrapper::ID3D11DeviceContext *context,
+		D3D11Base::ID3D11Resource *resource, int slot)
+{
+	//D3D11Base::D3D11_SHADER_RESOURCE_VIEW_DESC desc;
+	D3D11Wrapper::ID3D11Device *device;
+	//D3D11Base::ID3D11ShaderResourceView *view;
+	D3D11Base::ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+	int i;
+
+	// TODO: Save view for re-use, may even be able to re-use one the game created
+	//ZeroMemory(&desc, sizeof(desc));
+	//desc.Format = D3D11Base::DXGI_FORMAT_R32_FLOAT; // FIXME: Determine from resource
+	//desc.ViewDimension = D3D11Base::D3D11_SRV_DIMENSION_TEXTURE2D; // FIXME: regular / multisample / array
+	//desc.Texture2D.MostDetailedMip = 0; // FIXME
+	//desc.Texture2D.MipLevels = 1; // FIXME
+	//context->GetDevice(&device);
+	//device->CreateShaderResourceView(resource, &desc, &view);
+	//device->Release();
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, &SavedDepthTarget);
+	context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, NULL);
+//for (i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+//	if (targets[i])
+//		targets[i]->Release();
+	//context->PSSetShaderResources(slot, 1, &view);
+	//view->Release();
+
+	context->GetDevice(&device);
+	if (device->mZBufferResourceView) {
+		LogDebug("  adding Z buffer to shader resources in slot %i.\n", slot);
+		context->PSSetShaderResources(slot, 1, &device->mZBufferResourceView);
+	}
+	device->Release();
+}
+
+static void FixBadDepthBuffer(D3D11Wrapper::ID3D11DeviceContext *context)
+{
+	D3D11Base::ID3D11ShaderResourceView *ps_views[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT];
+	D3D11Base::ID3D11Resource *resource = NULL;
+	UINT64 hash = 0xdd64dbb61b36d8f6ULL; // HACK: Known bad depth texture in FC4 (MSAA / TXAA)
+	//UINT64 hash = 0x062c6213062bab8cULL; // HACK: Known bad depth texture in FC4 (No AA / SMAA) - double check
+	int i;
+
+	context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, ps_views);
+	for (i = 0; i < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT; i++) {
+		if (!ps_views[i])
+			continue;
+
+		ps_views[i]->GetResource(&resource);
+		if (!resource)
+			continue;
+
+		if (G->mRenderTargets[resource] == hash)
+			TransferDepthTargetToShaderInput(context, resource, i);
+
+		resource->Release();
+	}
+}
+
+static void RestoreDepthTarget(D3D11Wrapper::ID3D11DeviceContext *context)
+{
+	D3D11Base::ID3D11RenderTargetView *targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+	int i;
+
+	if (!SavedDepthTarget)
+		return;
+	context->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, NULL);
+	context->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, targets, SavedDepthTarget);
+//	SavedDepthTarget->Release();
+	SavedDepthTarget = NULL;
+//for (i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
+//	if (targets[i])
+//		targets[i]->Release();
+}
+
 static void RecordRenderTargetInfo(D3D11Base::ID3D11RenderTargetView *target, UINT view_num)
 {
 	D3D11Base::D3D11_RENDER_TARGET_VIEW_DESC desc;
@@ -545,12 +621,12 @@ STDMETHODIMP_(void) D3D11Wrapper::ID3D11DeviceContext::PSSetShader(THIS_
 				GetD3D11DeviceContext()->PSSetShaderResources(120, 1, &device->mIniResourceView);
 			}
 			// Set custom depth texture.
-			if (device->mZBufferResourceView)
-			{
-				LogDebug("  adding Z buffer to shader resources in slot 126.\n");
+			//if (device->mZBufferResourceView)
+			//{
+			//	LogDebug("  adding Z buffer to shader resources in slot 126.\n");
 
-				GetD3D11DeviceContext()->PSSetShaderResources(126, 1, &device->mZBufferResourceView);
-			}
+			//	GetD3D11DeviceContext()->PSSetShaderResources(126, 1, &device->mZBufferResourceView);
+			//}
 			device->Release();
 		}
 		else
@@ -731,6 +807,10 @@ static DrawContext BeforeDraw(D3D11Wrapper::ID3D11DeviceContext *context)
 		}
 		device->Release();
 	}
+
+	if (!data.skip)
+		FixBadDepthBuffer(context);
+
 	return data;
 }
 
@@ -752,6 +832,8 @@ static void AfterDraw(DrawContext &data, D3D11Wrapper::ID3D11DeviceContext *cont
 		}
 		device->Release();
 	}
+
+	RestoreDepthTarget(context);
 
 	// When in hunting mode, we need to get time to run the UI for stepping through shaders.
 	// This gets called for every Draw, and is a definitely overkill, but is a convenient spot
